@@ -11,7 +11,6 @@
 
 #include <openssl/e_os2.h>
 #include "crypto/sm4.h"
-#include <immintrin.h>
 
 static const uint8_t SM4_S[256] = {
     0xD6, 0x90, 0xE9, 0xFE, 0xCC, 0xE1, 0x3D, 0xB7, 0x16, 0xB6, 0x14, 0xC2,
@@ -334,150 +333,188 @@ int ossl_sm4_set_key(const uint8_t *key, SM4_KEY *ks)
 
 #ifndef OPENSSL_NO_SM4_NI
 # if (defined __SSE__) && (defined __SSE2__) && (defined __SSE3__) && (defined __AES__)
-#define MM256_PACK0_EPI32(a, b, c, d)                  \
-    _mm256_unpacklo_epi64(_mm256_unpacklo_epi32(a, b), \
-                          _mm256_unpacklo_epi32(c, d))
-#define MM256_PACK1_EPI32(a, b, c, d)                  \
-    _mm256_unpackhi_epi64(_mm256_unpacklo_epi32(a, b), \
-                          _mm256_unpacklo_epi32(c, d))
-#define MM256_PACK2_EPI32(a, b, c, d)                  \
-    _mm256_unpacklo_epi64(_mm256_unpackhi_epi32(a, b), \
-                          _mm256_unpackhi_epi32(c, d))
-#define MM256_PACK3_EPI32(a, b, c, d)                  \
-    _mm256_unpackhi_epi64(_mm256_unpackhi_epi32(a, b), \
-                          _mm256_unpackhi_epi32(c, d))
+# define SM4_TAU_L1 { \
+    y = _mm_and_si128(x, c0f);              \
+    y = _mm_shuffle_epi8(m1l, y);           \
+    x = _mm_srli_epi64(x, 4);               \
+    x = _mm_and_si128(x, c0f);              \
+    x = _mm_shuffle_epi8(m1h, x) ^ y;       \
+    x = _mm_shuffle_epi8(x, shr);           \
+    x = _mm_aesenclast_si128(x, c0f);       \
+    y = _mm_andnot_si128(x, c0f);           \
+    y = _mm_shuffle_epi8(m2l, y);           \
+    x = _mm_srli_epi64(x, 4);               \
+    x = _mm_and_si128(x, c0f);              \
+    x = _mm_shuffle_epi8(m2h, x) ^ y;       \
+    y = x ^ _mm_shuffle_epi8(x, r08) ^      \
+        _mm_shuffle_epi8(x, r16);           \
+    y = _mm_slli_epi32(y, 2) ^              \
+        _mm_srli_epi32(y, 30);              \
+    x = x ^ y ^ _mm_shuffle_epi8(x, r24);   \
+}
 
+/*  nibble mask */
+static __m128i c0f __attribute__((aligned(0x10))) =
+    { 0x0F0F0F0F0F0F0F0F, 0x0F0F0F0F0F0F0F0F };
+
+/*  flip all bytes in all 32-bit words */
+static __m128i flp __attribute__((aligned(0x10))) =
+    { 0x0405060700010203, 0x0C0D0E0F08090A0B };
+
+/* inverse shift rows */
+static __m128i shr __attribute__((aligned(0x10))) =
+    { 0x0B0E0104070A0D00, 0x0306090C0F020508 };
+
+/* Affine transform 1 (low and high hibbles) */
+static __m128i m1l __attribute__((aligned(0x10))) =
+    { 0x9197E2E474720701, 0xC7C1B4B222245157 };
+static __m128i m1h __attribute__((aligned(0x10))) =
+    { 0xE240AB09EB49A200, 0xF052B91BF95BB012 };
+
+/* Affine transform 2 (low and high hibbles) */
+static __m128i m2l __attribute__((aligned(0x10))) =
+    { 0x5B67F2CEA19D0834, 0xEDD14478172BBE82 };
+static __m128i m2h __attribute__((aligned(0x10))) =
+    { 0xAE7201DD73AFDC00, 0x11CDBE62CC1063BF };
+
+/* left rotations of 32-bit words by 8-bit increments  */
+static __m128i r08 __attribute__((aligned(0x10))) =
+    { 0x0605040702010003, 0x0E0D0C0F0A09080B };
+static __m128i r16 __attribute__((aligned(0x10))) =
+    { 0x0504070601000302, 0x0D0C0F0E09080B0A };
+static __m128i r24 __attribute__((aligned(0x10))) =
+    { 0x0407060500030201, 0x0C0F0E0D080B0A09 };
 
 void ossl_sm4_encrypt(const uint8_t *in, uint8_t *out, const SM4_KEY *ks) {
-    int enc = 0;
-    __m256i X[4], Temp[4], Mask;
-    Mask = _mm256_set1_epi32(0xFF);
-    //加载数据
-    Temp[0] = _mm256_loadu_si256((const __m256i*)in + 0);
-    Temp[1] = _mm256_loadu_si256((const __m256i*)in + 1);
-    Temp[2] = _mm256_loadu_si256((const __m256i*)in + 2);
-    Temp[3] = _mm256_loadu_si256((const __m256i*)in + 3);
-    //合并每组128bit数据的某32bit字
-    X[0] = MM256_PACK0_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    X[1] = MM256_PACK1_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    X[2] = MM256_PACK2_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    X[3] = MM256_PACK3_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    //转化端序
-    __m256i vindex =
-        _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
-                         3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-    X[0] = _mm256_shuffle_epi8(X[0], vindex);
-    X[1] = _mm256_shuffle_epi8(X[1], vindex);
-    X[2] = _mm256_shuffle_epi8(X[2], vindex);
-    X[3] = _mm256_shuffle_epi8(X[3], vindex);
-    // 32轮迭代
-    for (int i = 0; i < 32; i++) {
-        __m256i k =
-            _mm256_set1_epi32((enc == 0) ? ks->rk[i] : ks->rk[31 - i]);
-        Temp[0] = _mm256_xor_si256(_mm256_xor_si256(X[1], X[2]),
-                                   _mm256_xor_si256(X[3], k));
-        //查表
-        Temp[1] = _mm256_xor_si256(
-            X[0], _mm256_i32gather_epi32((const int*)SM4_SBOX_T3,
-                                         _mm256_and_si256(Temp[0], Mask), 4));
-        Temp[0] = _mm256_srli_epi32(Temp[0], 8);
-        Temp[1] = _mm256_xor_si256(
-            Temp[1], _mm256_i32gather_epi32(
-                         (const int*)SM4_SBOX_T2, _mm256_and_si256(Temp[0], Mask), 4));
-        Temp[0] = _mm256_srli_epi32(Temp[0], 8);
-        Temp[1] = _mm256_xor_si256(
-            Temp[1], _mm256_i32gather_epi32(
-                         (const int*)SM4_SBOX_T1, _mm256_and_si256(Temp[0], Mask), 4));
-        Temp[0] = _mm256_srli_epi32(Temp[0], 8);
-        Temp[1] = _mm256_xor_si256(
-            Temp[1], _mm256_i32gather_epi32(
-                         (const int*)SM4_SBOX_T0, _mm256_and_si256(Temp[0], Mask), 4));
+    __m128i x, y, t0, t1, t2, t3;
 
-        X[0] = X[1];
-        X[1] = X[2];
-        X[2] = X[3];
-        X[3] = Temp[1];
+    uint32_t k, *p32, v[4] __attribute__((aligned(0x10)));
+    int i;
+
+    p32 = (uint32_t *) in;
+    t0 = _mm_set_epi32(p32[12], p32[ 8], p32[ 4], p32[ 0]);
+    t0 = _mm_shuffle_epi8(t0, flp);
+    t1 = _mm_set_epi32(p32[13], p32[ 9], p32[ 5], p32[ 1]);
+    t1 = _mm_shuffle_epi8(t1, flp);
+    t2 = _mm_set_epi32(p32[14], p32[10], p32[ 6], p32[ 2]);
+    t2 = _mm_shuffle_epi8(t2, flp);
+    t3 = _mm_set_epi32(p32[15], p32[11], p32[ 7], p32[ 3]);
+    t3 = _mm_shuffle_epi8(t3, flp);
+
+    for (i = 0; i < 32;) {
+
+        k = ks->rk[i++];
+        x = t1 ^ t2 ^ t3 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t0 ^= x;
+
+        k = ks->rk[i++];
+        x = t0 ^ t2 ^ t3 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t1 ^= x;
+
+        k = ks->rk[i++];
+        x = t0 ^ t1 ^ t3 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t2 ^= x;
+
+        k = ks->rk[i++];
+        x = t0 ^ t1 ^ t2 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t3 ^= x;
     }
-    //转化端序
-    X[0] = _mm256_shuffle_epi8(X[0], vindex);
-    X[1] = _mm256_shuffle_epi8(X[1], vindex);
-    X[2] = _mm256_shuffle_epi8(X[2], vindex);
-    X[3] = _mm256_shuffle_epi8(X[3], vindex);
-    //恢复分组并装填
-    _mm256_storeu_si256((__m256i*)out + 0,
-                        MM256_PACK0_EPI32(X[3], X[2], X[1], X[0]));
-    _mm256_storeu_si256((__m256i*)out + 1,
-                        MM256_PACK1_EPI32(X[3], X[2], X[1], X[0]));
-    _mm256_storeu_si256((__m256i*)out + 2,
-                        MM256_PACK2_EPI32(X[3], X[2], X[1], X[0]));
-    _mm256_storeu_si256((__m256i*)out + 3,
-                        MM256_PACK3_EPI32(X[3], X[2], X[1], X[0]));
+
+    p32 = (uint32_t *) out;
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t3, flp));
+    p32[ 0] = v[0];
+    p32[ 4] = v[1];
+    p32[ 8] = v[2];
+    p32[12] = v[3];
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t2, flp));
+    p32[ 1] = v[0];
+    p32[ 5] = v[1];
+    p32[ 9] = v[2];
+    p32[13] = v[3];
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t1, flp));
+    p32[ 2] = v[0];
+    p32[ 6] = v[1];
+    p32[10] = v[2];
+    p32[14] = v[3];
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t0, flp));
+    p32[ 3] = v[0];
+    p32[ 7] = v[1];
+    p32[11] = v[2];
+    p32[15] = v[3];
 }
 
 void ossl_sm4_decrypt(const uint8_t *in, uint8_t *out, const SM4_KEY *ks) {
-    int enc = 1;
-    __m256i X[4], Temp[4], Mask;
-    Mask = _mm256_set1_epi32(0xFF);
-    //加载数据
-    Temp[0] = _mm256_loadu_si256((const __m256i*)in + 0);
-    Temp[1] = _mm256_loadu_si256((const __m256i*)in + 1);
-    Temp[2] = _mm256_loadu_si256((const __m256i*)in + 2);
-    Temp[3] = _mm256_loadu_si256((const __m256i*)in + 3);
-    //合并每组128bit数据的某32bit字
-    X[0] = MM256_PACK0_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    X[1] = MM256_PACK1_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    X[2] = MM256_PACK2_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    X[3] = MM256_PACK3_EPI32(Temp[0], Temp[1], Temp[2], Temp[3]);
-    //转化端序
-    __m256i vindex =
-        _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
-                         3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-    X[0] = _mm256_shuffle_epi8(X[0], vindex);
-    X[1] = _mm256_shuffle_epi8(X[1], vindex);
-    X[2] = _mm256_shuffle_epi8(X[2], vindex);
-    X[3] = _mm256_shuffle_epi8(X[3], vindex);
-    // 32轮迭代
-    for (int i = 0; i < 32; i++) {
-        __m256i k =
-            _mm256_set1_epi32((enc == 0) ? ks->rk[i] : ks->rk[31 - i]);
-        Temp[0] = _mm256_xor_si256(_mm256_xor_si256(X[1], X[2]),
-                                   _mm256_xor_si256(X[3], k));
-        //查表
-        Temp[1] = _mm256_xor_si256(
-            X[0], _mm256_i32gather_epi32((const int*)SM4_SBOX_T3,
-                                         _mm256_and_si256(Temp[0], Mask), 4));
-        Temp[0] = _mm256_srli_epi32(Temp[0], 8);
-        Temp[1] = _mm256_xor_si256(
-            Temp[1], _mm256_i32gather_epi32(
-                         (const int*)SM4_SBOX_T2, _mm256_and_si256(Temp[0], Mask), 4));
-        Temp[0] = _mm256_srli_epi32(Temp[0], 8);
-        Temp[1] = _mm256_xor_si256(
-            Temp[1], _mm256_i32gather_epi32(
-                         (const int*)SM4_SBOX_T1, _mm256_and_si256(Temp[0], Mask), 4));
-        Temp[0] = _mm256_srli_epi32(Temp[0], 8);
-        Temp[1] = _mm256_xor_si256(
-            Temp[1], _mm256_i32gather_epi32(
-                         (const int*)SM4_SBOX_T0, _mm256_and_si256(Temp[0], Mask), 4));
+    __m128i x, y, t0, t1, t2, t3;
 
-        X[0] = X[1];
-        X[1] = X[2];
-        X[2] = X[3];
-        X[3] = Temp[1];
+    uint32_t k, *p32, v[4] __attribute__((aligned(0x10)));
+    int i;
+
+    p32 = (uint32_t *) in;
+    t0 = _mm_set_epi32(p32[12], p32[ 8], p32[ 4], p32[ 0]);
+    t0 = _mm_shuffle_epi8(t0, flp);
+    t1 = _mm_set_epi32(p32[13], p32[ 9], p32[ 5], p32[ 1]);
+    t1 = _mm_shuffle_epi8(t1, flp);
+    t2 = _mm_set_epi32(p32[14], p32[10], p32[ 6], p32[ 2]);
+    t2 = _mm_shuffle_epi8(t2, flp);
+    t3 = _mm_set_epi32(p32[15], p32[11], p32[ 7], p32[ 3]);
+    t3 = _mm_shuffle_epi8(t3, flp);
+
+    for (i = 31; i >= 0;) {
+
+        k = ks->rk[i--];
+        x = t1 ^ t2 ^ t3 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t0 ^= x;
+
+        k = ks->rk[i--];
+        x = t0 ^ t2 ^ t3 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t1 ^= x;
+
+        k = ks->rk[i--];
+        x = t0 ^ t1 ^ t3 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t2 ^= x;
+
+        k = ks->rk[i--];
+        x = t0 ^ t1 ^ t2 ^ _mm_set_epi32(k, k, k, k);
+        SM4_TAU_L1
+        t3 ^= x;
     }
-    //转化端序
-    X[0] = _mm256_shuffle_epi8(X[0], vindex);
-    X[1] = _mm256_shuffle_epi8(X[1], vindex);
-    X[2] = _mm256_shuffle_epi8(X[2], vindex);
-    X[3] = _mm256_shuffle_epi8(X[3], vindex);
-    //恢复分组并装填
-    _mm256_storeu_si256((__m256i*)out + 0,
-                        MM256_PACK0_EPI32(X[3], X[2], X[1], X[0]));
-    _mm256_storeu_si256((__m256i*)out + 1,
-                        MM256_PACK1_EPI32(X[3], X[2], X[1], X[0]));
-    _mm256_storeu_si256((__m256i*)out + 2,
-                        MM256_PACK2_EPI32(X[3], X[2], X[1], X[0]));
-    _mm256_storeu_si256((__m256i*)out + 3,
-                        MM256_PACK3_EPI32(X[3], X[2], X[1], X[0]));
+
+    p32 = (uint32_t *) out;
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t3, flp));
+    p32[ 0] = v[0];
+    p32[ 4] = v[1];
+    p32[ 8] = v[2];
+    p32[12] = v[3];
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t2, flp));
+    p32[ 1] = v[0];
+    p32[ 5] = v[1];
+    p32[ 9] = v[2];
+    p32[13] = v[3];
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t1, flp));
+    p32[ 2] = v[0];
+    p32[ 6] = v[1];
+    p32[10] = v[2];
+    p32[14] = v[3];
+
+    _mm_store_si128((__m128i *) v, _mm_shuffle_epi8(t0, flp));
+    p32[ 3] = v[0];
+    p32[ 7] = v[1];
+    p32[11] = v[2];
+    p32[15] = v[3];
 }
 # else
 void ossl_sm4_encrypt(const uint8_t *in, uint8_t *out, const SM4_KEY *ks)

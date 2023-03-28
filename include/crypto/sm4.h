@@ -19,6 +19,10 @@
 #  error SM4 is disabled.
 # endif
 
+# if defined (__has_include) && (__has_include(<x86intrin.h>))
+# include <x86intrin.h>
+# endif
+
 # define SM4_ENCRYPT     1
 # define SM4_DECRYPT     0
 
